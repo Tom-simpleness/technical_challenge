@@ -1,6 +1,7 @@
 import os
 import tempfile
 
+from django.db.models import Sum
 from django.http import JsonResponse
 from django.views import View
 from django.views.decorators.csrf import csrf_exempt
@@ -61,16 +62,14 @@ class SummaryView(View):
         if date_to:
             transactions = transactions.filter(transacted_at__lte=date_to)
 
-        # Aggregate in Python
-        summary = {}
-        for t in transactions:
-            cat = t.category
-            if cat not in summary:
-                summary[cat] = 0
-            summary[cat] += float(t.amount)
+        summary = (
+            transactions
+            .values("category")
+            .annotate(total=Sum("amount"))
+            .order_by("-total")
+        )
 
-        result = [{"category": k, "total": round(v, 2)} for k, v in summary.items()]
-        result.sort(key=lambda x: x["total"], reverse=True)
+        result = [{"category": s["category"], "total": float(s["total"])} for s in summary]
 
         return JsonResponse({"results": result})
 

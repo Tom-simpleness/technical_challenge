@@ -124,3 +124,38 @@ curl -s http://localhost:8010/api/import/1/ | python -m json.tool
   }
 
 On vois le job vivre. Le client peut faire autre chose, et il check quand il veut.
+____________
+
+3. correction de l'agrégation côté Python 
+
+What.
+ La vue SummaryView.get agrège les transactions par catégorie côté Python. Elle charge tout le queryset filtré (Transaction.objects.all() puis filtres date), itère en Python, accumule dans un dict avec summary[cat] += float(t.amount), puis trie et sérialise.
+
+Why it matters.
+  - Mémoire et latence. Sur un dataset réaliste (millions de lignes), tout le queryset est ramené dans le process Django. Plusieurs Go de RAM, plusieurs minutes de
+   boucle. Le worker peut tomber en OOM ou bloquer le serveur, et la requête timeout.
+  - Anti-pattern récurrent. Même problème que le fix 1 : on remonte la donnée côté appli pour faire un calcul que la DB sait exécuter en quelques millisecondes avec un GROUP BY.
+  - Précision monétaire cassée. float(t.amount) convertit du Decimal en float avant la somme : on accumule des erreurs d'arrondi sur des centimes, ce qui n'est pas
+   acceptable en domaine financier.
+  - Pas d'index sur transacted_at (en complément). Combiné aux filtres date, le scan reste full-table.
+
+How I fix it.
+  - Remplacer la boucle Python par transactions.values("category").annotate(total=Sum("amount")).order_by("-total"). La DB exécute un seul SELECT category, SUM(amount) ... GROUP BY category ORDER BY ... et renvoie autant de lignes qu'il y a de catégories, peu importe le volume sous-jacent.
+  - Sum sur un DecimalField retourne un Decimal — la sommation reste exacte. La conversion en float ne se fait qu'à la sérialisation JSON finale, là où elle est sans risque.
+  - Le format de sortie reste strictement identique : liste d'objets {"category", "total"} triés par total décroissant.
+
+Test 100k lignes :
+Baselines
+$ time curl -s "http://localhost:8010/api/summary/?from=2024-01-01&to=2024-12-31" > /dev/null
+
+real    0m1.221s
+user    0m0.060s
+sys     0m0.030s
+
+Après:
+
+$ time curl -s "http://localhost:8010/api/summary/?from=2024-01-01&to=2024-12-31" > /dev/null
+
+real    0m0.171s
+user    0m0.046s
+sys     0m0.046s
