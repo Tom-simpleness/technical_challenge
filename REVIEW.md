@@ -1,4 +1,4 @@
-Suite au process_path, je challenge la découverte du temps d'ingestion trop long avec Claude. Évidence sur le traitement line by line à transformer en traitement par chunk. Je challenge mes idées avec différents contextes : "est-ce applicable sur une prod fonctionnelle avec 100M de lignes ?". Pair-programming du nouveau tasks.py avec Claude, 5 commits atomiques pour que l'historique git raconte le cheminement et pas juste l'arrivée. Sur un projet, j'aurais créé une branche propore à ce fix/upgrade. 
+Suite au process_path, je challenge la découverte du temps d'ingestion trop long avec Claude. Évidence sur le traitement line by line à transformer en traitement par chunk. Je challenge mes idées avec différents contextes : "est-ce applicable sur une prod fonctionnelle avec 100M de lignes ?". Pair-programming du nouveau tasks.py avec Claude, 5 commits atomiques pour que l'historique git raconte le cheminement et pas juste l'arrivée. Sur un projet, j'aurais créé une branche propore à chaque fix/upgrade. 
  
  1. Ingestion CSV ligne par ligne
  
@@ -159,3 +159,97 @@ $ time curl -s "http://localhost:8010/api/summary/?from=2024-01-01&to=2024-12-31
 real    0m0.171s
 user    0m0.046s
 sys     0m0.046s
+
+
+__________________
+__________________
+Non corrigé car non critique.
+
+Code
+
+1.Pas de cleanup du fichier tmp. Le CSV uploadé reste dans /tmp/imports/ après l'import, le volume Docker grossit indéfiniment. Trivial à corriger avec un os.unlink(file_path) dans un finally à la fin de la tâche Celery.
+2.Filtre date sans gestion de l'heure. ?to=2024-06-30 est interprété comme 00:00:00, donc toutes les transactions du 30 juin après minuit sont exclues silencieusement. Devrait être normalisé en fin de journée.
+
+Métier
+
+1. Agrégation cross-devise dans /api/summary/. Le Sum("amount") additionne EUR, USD et GBP dans la même case, ce qui n'a aucun sens métier. À résoudre soit en groupant par (category, currency), soit en convertissant vers une devise pivot via une table de taux. C'est une décision produit avant d'être tech.
+2. status et currency en CharField libre. Aucune contrainte côté Python ni DB n'empêche d'insérer currency="BANANA" ou status="🚀". Devrait utiliser choices=[...] au niveau modèle et un CheckConstraint côté DB pour que la garantie soit aussi à la couche basse.
+
+Sécurité
+
+1. Settings dangereux pour la prod. DEBUG=True expose les stack traces et le SQL en cas d'erreur, SECRET_KEY est hardcodé en clair dans le repo, ALLOWED_HOSTS=["*"] ouvre aux Host header attacks. Ces 3 valeurs devraient venir d'os.environ avec un .env.example documenté.
+2. csrf_exempt sur l'import + zéro authentification + aucune limite d'upload. N'importe qui sur internet peut envoyer un CSV de 50 Go en boucle sans être identifié ni rate-limité. Manquent : auth (token API minimum), DATA_UPLOAD_MAX_MEMORY_SIZE, validation du MIME type, et rate-limit sur l'endpoint.
+
+Architecture (next steps)
+
+1. Table dédiée ImportJobError. Le tracking des erreurs gagnerait à passer dans une table normalisée (job_id, row_index, error_type, message) insérable en bulk par chunk. Bénéfice : requêtable par type d'erreur, plus de risque de bloat sur error_log, et la croissance des erreurs n'impacte plus la lecture du job.
+2. ForeignKey Transaction → ImportJob. Aucune trace en base de quel import a créé quelle transaction, donc impossible d'annuler un import foiré ou d'auditer la provenance. Une FK avec on_delete=PROTECT rendrait possible la traçabilité ("quelles lignes a créé le job 42 ?").
+3. Découpage SOLID de la tâche Celery. import_transactions cumule aujourd'hui parsing, validation, dédup, persistance et tracking. À découper en CsvRowParser, RowValidator, TransactionRepository, JobProgressTracker. Chaque morceau devient unitairement testable et substituable (passer du CSV au JSONL revient à changer le parser).
+
+Qualité & tests manquants
+
+1. Aucun test. Le projet n'a aucune couverture. J'aurais ajouté des tests Django TestCase (built-in, sans nouvelle dépendance) : unitaires sur le parser et le validator, plus un test d'intégration sur le flow POST /api/import/ → GET /api/import/<id>/.
+2. Pas d'atomicité, pas de retry, jobs zombie. Le passage en chunks (fix 1) garantit que les lignes déjà insérées ne sont pas perdues si le worker crashe, mais le job reste à status="running" indéfiniment et aucun retry n'est tenté.
+3. Pas d'observability. Aucune métrique (durée d'import, débit lignes/sec, taille des chunks), aucun logging structuré. 
+
+Architecture proposée sans être complexe: 
+
+technical_challenge/
+├── config/                              # project-wide
+│   ├── __init__.py
+│   ├── celeryapp.py
+│   ├── settings/
+│   │   ├── base.py                      # commun
+│   │   ├── dev.py                       # DEBUG=True
+│   │   └── prod.py                      # secrets via env, ALLOWED_HOSTS strict
+│   └── urls.py
+│
+├── transactions/                        # bounded context (une app)
+│   ├── __init__.py
+│   ├── apps.py
+│   ├── urls.py
+│   ├── models.py                        # ORM uniquement (Transaction, ImportJob, ImportJobError)
+│   ├── migrations/
+│   │
+│   ├── api/                             # ←── exécuté par le conteneur `web`
+│   │   ├── __init__.py
+│   │   ├── views.py                     # ImportView, SummaryView, JobStatusView
+│   │   └── serializers.py               # validation des entrées
+│   │
+│   ├── tasks/                           # ←── exécuté par le conteneur `worker`
+│   │   ├── __init__.py
+│   │   └── import_transactions.py       # orchestration mince, délègue aux services
+│   │
+│   ├── services/                        # ←── logique métier pure, pas de Django/Celery
+│   │   ├── __init__.py
+│   │   ├── parser.py                    # CsvRowParser (CSV → dataclass)
+│   │   ├── validator.py                 # RowValidator (champs)
+│   │   ├── deduplicator.py              # batch dedup
+│   │   └── importer.py                  # use case d'import (orchestre les autres)
+│   │
+│   ├── repositories/                    # ←── accès données (ORM encapsulé)
+│   │   ├── __init__.py
+│   │   ├── transaction_repo.py          # bulk_create, queries
+│   │   └── import_job_repo.py
+│   │
+│   └── tests/
+│       ├── __init__.py
+│       ├── unit/                        # rapides, sans DB ni Celery
+│       │   ├── test_parser.py
+│       │   ├── test_validator.py
+│       │   └── test_deduplicator.py
+│       ├── integration/                 # avec DB de test
+│       │   ├── test_import_flow.py
+│       │   ├── test_summary_endpoint.py
+│       │   └── test_repositories.py
+│       └── fixtures/
+│           ├── valid.csv
+│           ├── with_duplicates.csv
+│           └── with_malformed_rows.csv
+│
+├── docker-compose.yml
+├── Dockerfile
+├── manage.py
+├── requirements.txt
+├── README.md
+└── REVIEW.md
