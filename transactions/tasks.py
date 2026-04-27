@@ -16,6 +16,8 @@ def import_transactions(job_id, file_path):
     job.status = "running"
     job.save()
 
+    errors = []
+
     for chunk in pd.read_csv(file_path, chunksize=1000):
         chunk_failed = 0
 
@@ -34,7 +36,7 @@ def import_transactions(job_id, file_path):
                 batch.append(t)
             except Exception as e:
                 chunk_failed += 1
-                job.error_log += f"Error on row {index} ({row.get('reference', '?')}): {e}\n"
+                errors.append(f"Error on row {index} ({row.get('reference', '?')}): {e}")
 
         refs_in_batch = [t.reference for t in batch]
         existing_refs = set(
@@ -46,7 +48,7 @@ def import_transactions(job_id, file_path):
         for t in batch:
             if t.reference in existing_refs or t.reference in seen:
                 chunk_failed += 1
-                job.error_log += f"Duplicate: {t.reference}\n"
+                errors.append(f"Duplicate: {t.reference}")
             else:
                 seen.add(t.reference)
                 to_insert.append(t)
@@ -56,6 +58,7 @@ def import_transactions(job_id, file_path):
         job.total_rows += len(chunk)
         job.imported_rows += len(to_insert)
         job.failed_rows += chunk_failed
+        job.error_log = "\n".join(errors)
         job.save()
 
     job.status = "done"
