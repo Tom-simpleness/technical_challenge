@@ -2,7 +2,7 @@ from django.db import models
 
 
 class Transaction(models.Model):
-    reference = models.CharField(max_length=64)
+    reference = models.CharField(max_length=64, unique=True)
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     currency = models.CharField(max_length=3)
     category = models.CharField(max_length=64)
