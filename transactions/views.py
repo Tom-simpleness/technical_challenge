@@ -33,20 +33,15 @@ class ImportView(View):
 
         job = ImportJob.objects.create(filename=file.name, status="pending")
 
-        # Queue the task
-        result = import_transactions.delay(job.id, tmp.name)
-
-        # Wait for it to finish before responding — so the client doesn't time out
-        result.get(timeout=300)
-
-        job.refresh_from_db()
+        import_transactions.delay(job.id, tmp.name)
 
         return JsonResponse(
             {
                 "job_id": job.id,
                 "imported": job.imported_rows,
                 "failed": job.failed_rows,
-            }
+            },
+            status=202,
         )
 
 

@@ -4,9 +4,9 @@ Suite au process_path, je challenge la découverte du temps d'ingestion trop lon
  
  What.
  import_transactions traite le CSV ligne par ligne. Pour chaque ligne, elle exécute trois opérations base de données :
-  - un SELECT pour vérifier si la référence existe déjà (tasks.py:28)
-  - un INSERT pour sauvegarder la nouvelle Transaction (tasks.py:44)
-  - un UPDATE sur ImportJob pour incrémenter les compteurs (tasks.py:31, :47, :52)
+  - un SELECT pour vérifier si la référence existe déjà 
+  - un INSERT pour sauvegarder la nouvelle Transaction 
+  - un UPDATE sur ImportJob pour incrémenter les compteurs 
 
   Les erreurs sont accumulées dans le champ error_log par concaténation de string (error_log += ...) et la ligne ImportJob complète est resave à chaque itération.
 
@@ -41,3 +41,86 @@ Pour le scope du challenge, la migration générée par défaut suffit.
   Résultat : 
 
 51s → 1.9s sur 5000 lignes.
+___________________________
+
+2. Problème d'asynchone cassé.
+
+Deuxième problème critique : la vue attend la fin de Celery via result.get avant de répondre → l'asynchrone est cassé. 
+
+What.
+La vue ImportView.post met la tâche Celery en file via import_transactions.delay(...) puis appelle immédiatement result.get(timeout=300) (views.py:40), qui poll Redis jusqu’à la fin du worker, jusqu’à 5 minutes.
+La réponse HTTP n’est envoyée qu’une fois la tâche terminée.
+L’endpoint /api/import/<job_id>/ existe déjà pour suivre l’avancement mais reste inutilisé à cause de ce comportement.
+
+Why it matters.
+Annule l’architecture asynchrone. Celery + Redis sont en place pour découpler le travail lent de la requête HTTP. Le .get() synchrone recouple les deux : on paie le coût d’infrastructure sans en récolter le bénéfice.
+Timeouts client. Les clients HTTP abandonnent bien avant 5 minutes. Sur un CSV de 100k+ lignes, le client voit une erreur alors que l’import continue côté serveur.
+Saturation des workers HTTP. Un worker Django bloqué sur .get() ne peut servir aucune autre requête. Avec 4 workers et 4 imports, tout le site est gelé.
+Incohérence du design. L’endpoint /api/import/<job_id>/ expose déjà l’état du job, mais il n’est pas exploité.
+
+How I fix it.
+Supprimer result.get(timeout=300) et le refresh_from_db() associé dans ImportView.post.
+Répondre immédiatement avec un HTTP 202 Accepted et le même JSON :
+{"job_id": ..., "imported": 0, "failed": 0}
+Le client suit la progression via GET /api/import/<job_id>/, déjà en place.
+Contrat d’API. Les URLs et le format de réponse restent identiques. Seul le timing change : réponse immédiate au lieu d’attendre la fin de l’import. C’est une correction de comportement, pas une rupture.
+
+Avant: 
+
+$ time curl -i -F "file=@sample_transactions.csv" http://localhost:8010/api/import/
+HTTP/1.1 200 OK
+Date: Mon, 27 Apr 2026 11:22:14 GMT
+Server: WSGIServer/0.2 CPython/3.11.14
+Content-Type: application/json
+Connection: close
+
+{"job_id": 1, "imported": 4930, "failed": 70}
+real    0m1.875s
+user    0m0.047s
+sys     0m0.060s
+
+Après: 
+$ time curl -i -F "file=@sample_transactions.csv" http://localhost:8010/api/import/
+HTTP/1.1 202 Accepted
+Date: Mon, 27 Apr 2026 11:26:50 GMT
+Server: WSGIServer/0.2 CPython/3.11.14
+Content-Type: application/json
+Connection: close
+
+{"job_id": 1, "imported": 0, "failed": 0}
+real    0m0.498s
+user    0m0.030s
+sys     0m0.373s
+
+
+curl -s http://localhost:8010/api/import/1/ | python -m json.tool
+
+  Au début (juste après le POST, dans la première seconde) :
+  {
+      "id": 1,
+      "status": "running",
+      "total_rows": 1000,
+      "imported_rows": 985,
+      "failed_rows": 15,
+      "started_at": "...",
+      "finished_at": null
+  }
+
+  Au milieu :
+  {
+      "status": "running",
+      "total_rows": 3000,
+      "imported_rows": 2960,
+      ...
+  }
+
+  À la fin:
+  {
+      "status": "done",
+      "total_rows": 5000,
+      "imported_rows": 4930,
+      "failed_rows": 70,
+      "finished_at": "..."
+  }
+
+On vois le job vivre. Le client peut faire autre chose, et il check quand il veut.
