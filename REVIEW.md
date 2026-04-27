@@ -1,3 +1,5 @@
+Suite au process_path, je challenge la découverte du temps d'ingestion trop long avec Claude. Évidence sur le traitement line by line à transformer en traitement par chunk. Je challenge mes idées avec différents contextes : "est-ce applicable sur une prod fonctionnelle avec 100M de lignes ?". Pair-programming du nouveau tasks.py avec Claude, 5 commits atomiques pour que l'historique git raconte le cheminement et pas juste l'arrivée. Sur un projet, j'aurais créé une branche propore à ce fix/upgrade. 
+ 
  1. Ingestion CSV ligne par ligne
  
  What.
@@ -35,3 +37,7 @@ Pour le scope du challenge, la migration générée par défaut suffit.
 
   What next (pas critique) :
    - Déplacer le tracking des erreurs vers une table dédiée ImportJobError(job_id, row_index, error_type, message). Permet le bulk_insert par chunk, le filtrage par type d'erreur, et évite tout risque de bloat sur ImportJob.error_log.
+
+  Résultat : 
+
+51s → 1.9s sur 5000 lignes.

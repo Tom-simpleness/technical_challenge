@@ -46,3 +46,5 @@ remarque : Le code actuel traite 100 lignes/seconde. À l'échelle de 1M de lign
 Je pense que c'est déjà un bon point de départ qui va m'amener à creuser tasks.py
 
 En parallèle je demande un état des lieux du projet à Claude en l'orientant sur ces problématiques data et le temps d'ingestion du document 
+
+Suite REVIEW.MD
