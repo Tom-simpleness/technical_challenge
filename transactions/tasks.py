@@ -1,5 +1,6 @@
 import pandas as pd
 from datetime import datetime
+from decimal import Decimal
 from celery import shared_task
 from django.utils import timezone
 
@@ -24,9 +25,12 @@ def import_transactions(job_id, file_path):
         batch = []
         for index, row in chunk.iterrows():
             try:
+                if row.isna().any():
+                    missing = list(row.index[row.isna()])
+                    raise ValueError(f"empty fields: {missing}")
                 t = Transaction(
                     reference=row["reference"],
-                    amount=row["amount"],
+                    amount=Decimal(str(row["amount"])),
                     currency=row["currency"],
                     category=row["category"],
                     merchant=row["merchant"],
